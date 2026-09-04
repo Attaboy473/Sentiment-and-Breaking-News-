@@ -1,0 +1,5 @@
+demo.db
+demo.db-journal
+demo.db-wal
+__pycache__/
+*.pyc

@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MarketForge Demo — Sentiment & Breaking Event</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/></svg></span>
+    <div>
+      <h1>MarketForge <span class="demo-badge">Demo</span></h1>
+      <p class="sub">Pipeline Sentiment Stockbit + Breaking Event — standalone, hasil telaah project bundle</p>
+    </div>
+  </div>
+  <div class="header-actions">
+    <button id="btnTheme" class="btn btn-icon" title="Ganti tema terang/gelap" aria-label="Ganti tema"></button>
+    <button id="btnPoll" class="btn btn-primary">Poll sekarang</button>
+    <button id="btnReset" class="btn">Reset DB</button>
+  </div>
+</header>
+
+<div id="toast" class="toast hidden"></div>
+
+<div class="shell">
+<div class="layout">
+  <div class="main-col">
+    <section class="healthbar">
+      <div class="hcard" id="hcStockbit">
+        <div class="hhead"><span class="dot"></span> Stockbit Collector</div>
+        <div class="hmeta" id="hcStockbitMeta">—</div>
+      </div>
+      <div class="hcard" id="hcRss">
+        <div class="hhead"><span class="dot"></span> Breaking News RSS</div>
+        <div class="hmeta" id="hcRssMeta">—</div>
+      </div>
+      <div class="hcard">
+        <div class="hhead">Store</div>
+        <div class="hmeta" id="hcStore">—</div>
+      </div>
+      <div class="hcard">
+        <div class="hhead">Mode (kejujuran demo)</div>
+        <div class="hmeta" id="hcMode">—</div>
+      </div>
+    </section>
+
+    <main>
+      <!-- VIEW: SENTIMENT -->
+      <section class="grid-2" data-view="sentiment">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Board Rekomendasi <span class="muted">(baseline DUMMY)</span></h2>
+            <p class="hint">Event material (rule score ≥45 + severity HIGH/CRITICAL + ada ticker) → rekomendasi terdampak di-flag <b>STALE</b> → reassessment ter-simulasi ±20 dtk.</p>
+          </div>
+          <div id="recoBoard" class="reco-board"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Community Sentiment <span class="muted">(per ticker)</span></h2>
+            <div class="tabs">
+              <button class="tab active" data-w="24">24 jam</button>
+              <button class="tab" data-w="1">1 jam</button>
+            </div>
+          </div>
+          <p class="hint">Metrik dari implementation plan: mention, author unik, net sentiment, velocity. <b>v2</b> = skor per-cashtag (post multi-ticker dihitung per konteks masing-masing ticker). Post noise (akun resmi/isreport/isnews/terlalu pendek) dibuang dari agregat — kolom "Filter" = jumlah yang dibuang.</p>
+          <div id="sentTable"></div>
+        </div>
+      </section>
+
+      <!-- Sektor: rollup 24 jam dari sentiment retail -->
+      <section class="panel" data-view="sentiment">
+        <div class="panel-head">
+          <h2>Sektor Watchlist <span class="muted">(rollup sentiment 24 jam)</span></h2>
+          <p class="hint">Agregat tematik per sektor dari post retail yang udah lewat filter noise — bukan klasifikasi board IDX resmi.</p>
+        </div>
+        <div id="sectorBoard" class="sector-board"></div>
+      </section>
+
+      <!-- VIEW: NEWS -->
+      <section class="panel" data-view="news">
+        <div class="panel-head">
+          <div>
+            <h2>News Hub <span class="muted">(ala News Preview + rule engine)</span></h2>
+            <p class="hint">Breaking Events = artikel berimbas tinggi (rule score ≥45) yang memicu alur stale→reassess. Semua Artikel = seluruh hasil scan RSS 48 jam dengan skor relevansi. Sumber: ANTARA Bursa &amp; Finansial. Klik kartu breaking event → audit trail.</p>
+          </div>
+          <button id="btnSim" class="btn">Simulasi breaking event</button>
+        </div>
+
+        <div class="news-stats" id="newsStats"></div>
+
+        <h3 class="subhead">Breaking Events <span class="muted">(rule score ≥45, ≤3 jam)</span></h3>
+        <div class="chips" id="newsChips"></div>
+        <div id="eventList" class="event-list"></div>
+
+        <h3 class="subhead">Semua Artikel <span class="muted">(hasil scan RSS, 48 jam)</span></h3>
+        <div class="chips" id="newsCatChips"></div>
+        <div id="articleList" class="event-list"></div>
+
+        <h3 class="subhead" id="chatterHead">Chatter Stockbit <span class="muted">(12 post terbaru per ticker)</span></h3>
+        <div class="chatter-head">
+          <select id="chatterTicker" class="select"></select>
+        </div>
+        <div id="chatterList" class="chatter-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- SIDEBAR KANAN (drawer full-height ala Streamlit: handle di kiri panel) -->
+  <aside class="sidebar-wrap">
+    <button id="sidePull" class="side-pull" title="Buka/tutup panel kanan" aria-label="Toggle panel kanan"><span class="chev">❯</span></button>
+    <div class="sidebar">
+      <div class="side-label">Tampilan</div>
+      <nav class="side-nav">
+        <button class="side-btn active" data-view="sentiment">Sentiment</button>
+        <button class="side-btn" data-view="news">News</button>
+      </nav>
+      <div class="side-stats" id="sideStats">—</div>
+      <div class="side-note">Health bar &amp; tombol Poll berlaku global untuk kedua tampilan.</div>
+    </div>
+  </aside>
+</div>
+</div>
+
+<!-- Event detail modal -->
+<div id="modal" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="mTitle">Event</h3>
+      <button class="btn btn-icon" id="mClose" aria-label="Tutup"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+    </div>
+    <div id="mBody" class="modal-body"></div>
+  </div>
+</div>
+
+<footer class="footer-note">
+  <p><b>Catatan jujur:</b> standalone demo dari MarketForge_Complete_Project_Bundle — sentiment = heuristik lexicon (belum dikalibrasi) · rekomendasi = dummy baseline · LLM validator = rule proxy. Bukan saran investasi.</p>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
