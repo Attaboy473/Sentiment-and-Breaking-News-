@@ -1,5 +1,19 @@
+# --- database & runtime state ---
 demo.db
 demo.db-journal
 demo.db-wal
+demo.db-shm
+demo_backup_*.db
+
+# --- model & venv (JANGAN di-commit: ratusan MB) ---
+.venv-ml/
+models/
+
+# --- python ---
 __pycache__/
 *.pyc
+*.pyo
+
+# --- os/editor ---
+Thumbs.db
+.DS_Store

@@ -16,6 +16,10 @@
     </div>
   </div>
   <div class="header-actions">
+    <form id="searchForm" class="search-form" role="search">
+      <input id="searchInput" class="search-input" type="search" placeholder="Cari post &amp; berita by makna…" autocomplete="off" aria-label="Semantic search">
+      <button class="btn btn-icon" type="submit" title="Cari" aria-label="Cari"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></button>
+    </form>
     <button id="btnTheme" class="btn btn-icon" title="Ganti tema terang/gelap" aria-label="Ganti tema"></button>
     <button id="btnPoll" class="btn btn-primary">Poll sekarang</button>
     <button id="btnReset" class="btn">Reset DB</button>
@@ -27,26 +31,7 @@
 <div class="shell">
 <div class="layout">
   <div class="main-col">
-    <section class="healthbar">
-      <div class="hcard" id="hcStockbit">
-        <div class="hhead"><span class="dot"></span> Stockbit Collector</div>
-        <div class="hmeta" id="hcStockbitMeta">—</div>
-      </div>
-      <div class="hcard" id="hcRss">
-        <div class="hhead"><span class="dot"></span> Breaking News RSS</div>
-        <div class="hmeta" id="hcRssMeta">—</div>
-      </div>
-      <div class="hcard">
-        <div class="hhead">Store</div>
-        <div class="hmeta" id="hcStore">—</div>
-      </div>
-      <div class="hcard">
-        <div class="hhead">Mode (kejujuran demo)</div>
-        <div class="hmeta" id="hcMode">—</div>
-      </div>
-    </section>
-
-    <main>
+  <main>
       <!-- VIEW: SENTIMENT -->
       <section class="grid-2" data-view="sentiment">
         <div class="panel">
@@ -104,6 +89,17 @@
           <select id="chatterTicker" class="select"></select>
         </div>
         <div id="chatterList" class="chatter-list"></div>
+      </section>
+
+      <!-- VIEW: SEARCH -->
+      <section class="panel" data-view="search">
+        <div class="panel-head">
+          <div>
+            <h2>Hasil Pencarian <span class="muted" id="searchMode"></span></h2>
+            <p class="hint">Semantic search (MiniLM multilingual): nyari berdasarkan <b>makna</b>, bukan kata persis — "bankrut" bisa nangkep post yang nulis "pailit". Kalau engine embedding mati, otomatis fallback ke pencarian kata kunci.</p>
+          </div>
+        </div>
+        <div id="searchResults" class="event-list"></div>
       </section>
     </main>
   </div>

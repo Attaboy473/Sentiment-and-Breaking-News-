@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
@@ -32,6 +33,7 @@ import sqlite3
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -49,6 +51,7 @@ PORT = int(os.getenv("DEMO_PORT", "8004"))
 COLLECT_INTERVAL = int(os.getenv("DEMO_COLLECT_INTERVAL", "300"))   # >= 300 (CDN cache 300s)
 BREAKING_INTERVAL = int(os.getenv("DEMO_BREAKING_INTERVAL", "60"))
 REASSESS_DELAY = int(os.getenv("DEMO_REASSESS_DELAY", "20"))        # simulated reassessment
+NEWS_RETENTION_H = int(os.getenv("DEMO_NEWS_RETENTION_H", "48"))    # retensi artikel news (Phase 1)
 
 WIB = timezone(timedelta(hours=7))
 TAG_RE = re.compile(r"<[^>]+>")
@@ -81,7 +84,35 @@ IMPACT_KEYWORDS = {
 }
 HARD_EVENTS = {"suspensi", "pailit", "gagal bayar", "fraud", "delisting",
                "izin dicabut", "produksi dihentikan", "ledakan"}
+# P3.5: denial guard - judul berisi frasa ini -> keyword material disuppress
+# (dok V2 13.2: "membantah isu pailit" bukan event pailit)
+DENIAL_PHRASES = [
+    "membantah", "bantah", "bantahan", "sanggah", "menyanggah", "klarifikasi",
+    "tidak berdampak", "tidak terdampak", "kembali normal", "belum dikonfirmasi",
+    "rumor", "isu",
+]
+# P3: entity resolver - alias nama emiten -> ticker, dgn confidence per alias
+# (urutan bebas; yang dipakai = confidence TERTINGGI yang match)
+TICKER_ALIASES = {
+    "BBCA": {"bank central asia": 0.95, "bank bca": 0.95, "bca": 0.85},
+    "BBRI": {"bank rakyat indonesia": 0.95, "bank bri": 0.95, "bri": 0.85},
+    "BMRI": {"bank mandiri": 0.95, "mandiri": 0.7},
+    "TLKM": {"telkom indonesia": 0.95, "telkom": 0.9, "telkomsel": 0.8, "indihome": 0.7},
+    "ANTM": {"aneka tambang": 0.95, "antam": 0.9},
+    "INCO": {"vale indonesia": 0.95, "pt vale": 0.9, "vale": 0.75},
+    "ADRO": {"adaro energy": 0.95, "adaro": 0.9, "alamtri": 0.8},
+    "BUMI": {"bumi resources": 0.95},
+    "GOTO": {"goto gojek tokopedia": 0.95, "gojek": 0.85, "tokopedia": 0.85, "goto": 0.7},
+    "UNTR": {"united tractors": 0.95, "untr": 0.7},
+}
+ENTITY_CONF_HIGH = 0.8      # minimal utk bonus skor breaking (+15/+12)
+ENTITY_CONF_RELATION = 0.7  # minimal utk bikin relasi post<->ticker
 CANDIDATE_THRESHOLD = 45.0
+# Eskalasi by-context berita: rule "hampir" + semantic yakin material ->
+# dinaikin tipis ke atas threshold (kalibrasi margin dari 40 pilot; floor
+# sengaja deket threshold biar eskalasi jarang & terkontrol).
+ESCALATE_FLOOR = 40.0
+ESCALATE_MARGIN = 0.20  # skala Cohere (kalibrasi 40 pilot, flat 0.20-0.50)
 MAX_ITEM_AGE_MIN = 180
 
 SECTOR_ALIASES = {
@@ -114,6 +145,15 @@ SLANG_NORM = {
 }
 INTENSIFIERS = {"banget": 1.5, "bgt": 1.5, "gila": 1.4, "gilak": 1.4, "parah": 1.3,
                 "sangat": 1.4, "sungguh": 1.3, "bener": 1.2, "dahsyat": 1.4}
+# P3.5: intent-flip frasa - negator+kata harga; nilai dict = arah final
+INTENT_FLIP = {
+    ("gak", "rugi"): 1, ("ga", "rugi"): 1, ("nggak", "rugi"): 1, ("ngga", "rugi"): 1,
+    ("tidak", "rugi"): 1, ("gk", "rugi"): 1, ("tdk", "rugi"): 1, ("bukan", "rugi"): 1,
+    ("gak", "turun"): 1, ("tidak", "turun"): 1, ("gak", "anjlok"): 1, ("gak", "jeblok"): 1,
+    ("gak", "bocor"): 1, ("gak", "panik"): 1, ("gak", "panic"): 1, ("gak", "macet"): 1,
+    ("gak", "naik"): -1, ("ga", "naik"): -1, ("gak", "gacor"): -1, ("gak", "cuan"): -1,
+    ("belum", "naik"): -1,
+}
 
 HEALTH = {
     "stockbit": {"status": "init", "last_ok": None, "last_error": None, "posts": 0, "new": 0, "overlap": None},
@@ -128,6 +168,7 @@ HEALTH = {
 def conn() -> sqlite3.Connection:
     c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")  # P0: FK aktif, baris join orphan ditolak
     return c
 
 
@@ -194,6 +235,21 @@ def init_db() -> None:
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
         """)
+        # P0: bersihkan orphan join dari data lama (jalan sekali tiap start)
+        c.execute("DELETE FROM stream_post_tickers WHERE postid NOT IN (SELECT postid FROM stream_posts)")
+        # semantic materiality: kolom opsional (idempotent — aman kalau udah ada)
+        for _stmt in ("ALTER TABLE news_articles ADD COLUMN sem_margin REAL",
+                      "ALTER TABLE news_articles ADD COLUMN sem_label TEXT",
+                      "CREATE TABLE IF NOT EXISTS semantic_direction_log ("
+                      "postid INTEGER NOT NULL, ticker TEXT NOT NULL, direction TEXT NOT NULL,"
+                      " sim REAL, created_at TEXT, PRIMARY KEY (postid, ticker))"):
+            try:
+                c.execute(_stmt)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column" not in str(exc).lower():
+                    raise
+        c.execute("DELETE FROM sentiment_predictions WHERE postid NOT IN (SELECT postid FROM stream_posts)")
+        c.execute("DELETE FROM sentiment_per_ticker WHERE postid NOT IN (SELECT postid FROM stream_posts)")
 
 
 def now_utc() -> datetime:
@@ -213,6 +269,38 @@ def author_hash(username: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# Phase 2: security & data hygiene (external content = untrusted)
+# --------------------------------------------------------------------------
+PII_FIELDS = {
+    "username", "user", "userid", "user_id", "author", "author_id",
+    "full_name", "name", "bio", "email", "avatar", "avatar_url", "profile_url",
+}
+TAG_RE = re.compile(r"<[^>]+>")
+WS_RE = re.compile(r"\s+")
+
+
+def sanitize_post(p: dict) -> dict:
+    """Raw payload SEBELUM persist: field identitas/PII dibuang (username dsb
+    gak ikut tersimpan — yang ke-save cuma author_hash). Nested dict ikut dibersihin."""
+    out = {}
+    for k, v in p.items():
+        if str(k).lower() in PII_FIELDS:
+            continue
+        if isinstance(v, dict):
+            v = sanitize_post(v)
+        out[k] = v
+    return out
+
+
+def clean_text(s: str | None, limit: int = 8000) -> str:
+    """Teks RSS: strip tag HTML + entity + normalisasi whitespace + batasi panjang."""
+    if not s:
+        return ""
+    s = html.unescape(TAG_RE.sub(" ", s))
+    return WS_RE.sub(" ", s).strip()[:limit]
+
+
+# --------------------------------------------------------------------------
 # Sentiment (demo-grade lexicon heuristic)
 # --------------------------------------------------------------------------
 def tokenize(text: str) -> list[str]:
@@ -223,16 +311,43 @@ def tokenize(text: str) -> list[str]:
 
 
 def sentiment_score(text: str) -> tuple[str, float, list[str]]:
-    """Returns (label, score -1..1, matched_hits). Negation flips a hit."""
+    """Returns (label, score -1..1, matched_hits).
+    P3.5: bigram pass lebih dulu - frasa multi-kata dari kamus ("gap down") +
+    intent-flip frasa ("gak rugi" = bullish). Kata kedua bigram di-skip di
+    unigram pass biar gak dihitung dobel."""
     toks = [_norm_token(w) for w in tokenize(text)]
     hits: list[str] = []
-    bull = bear = 0
+    bull = bear = 0.0
+    skip: set[int] = set()
+    for i in range(len(toks) - 1):  # P3.5: context pass (bigram)
+        a, b = toks[i], toks[i + 1]
+        pair, big = (a, b), f"{a} {b}"
+        if pair in INTENT_FLIP:
+            skip.add(i + 1)
+            hits.append("!" + big)
+            if INTENT_FLIP[pair] > 0:
+                bull += 1
+            else:
+                bear += 1
+        elif big in LEX_BULL:
+            skip.add(i + 1)
+            hits.append(big)
+            bull += 1
+        elif big in LEX_BEAR:
+            skip.add(i + 1)
+            hits.append(big)
+            bear += 1
+        elif a in NEGATORS and (b in LEX_BULL or b in LEX_BEAR):
+            skip.add(i + 1)
+            hits.append("!" + big)
+            if b in LEX_BULL:
+                bull += 1
+            else:
+                bear += 1
     for i, w in enumerate(toks):
-        val = 0
-        if w in LEX_BULL:
-            val = 1
-        elif w in LEX_BEAR:
-            val = -1
+        if i in skip or w in NEGATORS:
+            continue
+        val = 1 if w in LEX_BULL else (-1 if w in LEX_BEAR else 0)
         if val == 0:
             continue
         negated = any(toks[j] in NEGATORS for j in range(max(0, i - 2), i))
@@ -283,13 +398,33 @@ def sentiment_for_ticker(text: str, ticker: str) -> tuple[str, float] | None:
         else:
             nxt = boundaries[idx + 1] if idx + 1 < len(boundaries) else len(toks)
             seg = toks[p + 1:nxt]
+        skip: set[int] = set()  # P3.5: context pass per segmen
+        for i in range(len(seg) - 1):
+            a, b = seg[i], seg[i + 1]
+            pair, big = (a, b), f"{a} {b}"
+            if pair in INTENT_FLIP:
+                skip.add(i + 1)
+                if INTENT_FLIP[pair] > 0:
+                    bull += 1.0
+                else:
+                    bear += 1.0
+            elif big in LEX_BULL:
+                skip.add(i + 1)
+                bull += 1.0
+            elif big in LEX_BEAR:
+                skip.add(i + 1)
+                bear += 1.0
+            elif a in NEGATORS and (b in LEX_BULL or b in LEX_BEAR):
+                skip.add(i + 1)
+                if b in LEX_BULL:
+                    bull += 1.0
+                else:
+                    bear += 1.0
         for i, w in enumerate(seg):
-            val = 0
-            if w in LEX_BULL:
-                val = 1
-            elif w in LEX_BEAR:
-                val = -1
-            if not val:
+            if i in skip or w in NEGATORS:
+                continue
+            val = 1 if w in LEX_BULL else (-1 if w in LEX_BEAR else 0)
+            if val == 0:
                 continue
             if any(seg[j] in NEGATORS for j in range(max(0, i - 2), i)):
                 val = -val
@@ -360,6 +495,7 @@ def collect_once() -> dict:
                 pid = p.get("postid")
                 if not pid:
                     continue
+                alias_hits = resolve_tickers(p.get("content_original") or "")  # P3
                 ts_src = p.get("created")
                 dt = parse_src_ts(ts_src)
                 cur = c.execute(
@@ -381,7 +517,7 @@ def collect_once() -> dict:
                             "isreport": bool(p.get("isreport")),
                             "isnews": bool(p.get("isnews")),
                         }),
-                        json.dumps(p, ensure_ascii=False, default=str)[:8000],
+                        json.dumps(sanitize_post(p), ensure_ascii=False, default=str)[:8000],  # P2: tanpa PII
                         iso(now_utc()),
                     ),
                 )
@@ -394,19 +530,32 @@ def collect_once() -> dict:
                         "VALUES (?,?,?,?,?,?,?)",
                         (pid, "lexicon-demo-v1", label, "watch", score, 0.5, iso(now_utc())),
                     )
-                    # v2: skor per-cashtag (post multi-ticker gak lagi "sama rata")
-                    joined = dict.fromkeys([sym] + [x for x in (p.get("topics") or []) if isinstance(x, str)])
+                    try:  # resolve arah semantic buat NEUTRAL (sidecar mati -> fallback pass-through)
+                        sys.path.insert(0, BASE_DIR)
+                        from ml.search.chatter_direction import resolve_direction
+                    except Exception:  # noqa: BLE001
+                        def resolve_direction(_pid, _t, _txt, lab, sc):
+                            return lab, sc, "lexicon-v3"
+                    # v3: skor per-cashtag (post multi-ticker gak lagi "sama rata").
+                    # NEUTRAL per-ticker di-resolve arahnya pake bukti semantic
+                    # kNN (sim>=0.75, k=3 wajib sepakat) -> label jadi
+                    # bullish/bearish via model_version=semantic-knn-v1, jadi
+                    # ikut terhitung di agregat. Sidecar mati -> tetap neutral.
+                    joined = dict.fromkeys([sym] + [x for x in (p.get("topics") or []) if isinstance(x, str)]
+                                           + [t for t, c, _ in alias_hits if c >= ENTITY_CONF_RELATION])
                     for t in joined:
                         if not re.fullmatch(r"[A-Z]{4}", str(t)):
                             continue
                         v2 = sentiment_for_ticker(p.get("content_original") or "", str(t))
                         if v2 is None:
                             v2 = (label, score)  # fallback whole-post
+                        s_label, s_score, s_model = resolve_direction(
+                            pid, str(t), p.get("content_original") or "", v2[0], v2[1])
                         c.execute(
                             "INSERT OR REPLACE INTO sentiment_per_ticker "
                             "(postid, ticker, model_version, sentiment, score, processed_at) "
                             "VALUES (?,?,?,?,?,?)",
-                            (pid, t, "lexicon-v2", v2[0], v2[1], iso(now_utc())),
+                            (pid, t, s_model, s_label, s_score, iso(now_utc())),
                         )
                 for t in dict.fromkeys([sym] + [x for x in (p.get("topics") or []) if isinstance(x, str)]):
                     if re.fullmatch(r"[A-Z]{4}", str(t)):
@@ -414,6 +563,13 @@ def collect_once() -> dict:
                             "INSERT OR IGNORE INTO stream_post_tickers (postid, ticker, relation_source, confidence) "
                             "VALUES (?,?,?,?)",
                             (pid, t, "server_topic", 0.9),
+                        )
+                for t, conf, _via in alias_hits:  # P3: relasi dari nama emiten
+                    if conf >= ENTITY_CONF_RELATION:
+                        c.execute(
+                            "INSERT OR IGNORE INTO stream_post_tickers (postid, ticker, relation_source, confidence) "
+                            "VALUES (?,?,?,?)",
+                            (pid, t, "company_name", conf),
                         )
         time.sleep(1.5)  # stagger between tickers
 
@@ -506,12 +662,12 @@ def aggregate(window_hours: int) -> list[dict]:
                        sp.text_original, sp.created_at_utc,
                        COALESCE(spv.sentiment, sen.sentiment) AS sentiment,
                        COALESCE(spv.score, sen.score) AS score,
-                       CASE WHEN spv.postid IS NOT NULL THEN 'lexicon-v2' ELSE 'lexicon-demo-v1' END AS model_used
+                       CASE WHEN spv.postid IS NOT NULL THEN spv.model_version ELSE 'lexicon-demo-v1' END AS model_used
                 FROM stream_post_tickers spt
                 JOIN stream_posts sp ON sp.postid = spt.postid
                 LEFT JOIN sentiment_per_ticker spv
                        ON spv.postid = sp.postid AND spv.ticker = spt.ticker
-                      AND spv.model_version = 'lexicon-v2'
+                      AND spv.model_version = 'lexicon-v3'
                 LEFT JOIN sentiment_predictions sen
                        ON sen.postid = sp.postid AND sen.model_version = 'lexicon-demo-v1'
                 WHERE spt.ticker = ?
@@ -591,6 +747,12 @@ def norm(v: str) -> str:
     return SPACE_RE.sub(" ", v).strip()
 
 
+def denial_hits(ntext: str) -> list[str]:
+    """P3.5: frasa bantahan/negasi material di judul (hard negatives dok V2 13.2)."""
+    padded = f" {ntext} "
+    return [p for p in DENIAL_PHRASES if f" {p} " in padded]
+
+
 def lname(tag: str) -> str:
     return tag.rsplit("}", 1)[-1].lower()
 
@@ -624,6 +786,25 @@ def detect_entities(text: str, mapping: dict[str, list[str]]) -> list[str]:
                 found.append(entity)
                 break
     return sorted(set(found))
+
+
+def resolve_tickers(text: str) -> list[tuple[str, float, str]]:
+    """P3: resolver emiten -> [(ticker, confidence, via)].
+    Cashtag $TICKER = 1.0; nama/alias emiten = confidence per kamus (max yang match).
+    Word-boundary matching di teks ternormalisasi (aman dari substring)."""
+    ntext = f" {norm(text)} "
+    hits = []
+    for t in TICKERS:
+        if f" ${t.lower()} " in ntext:
+            hits.append((t, 1.0, "cashtag"))
+            continue
+        best = None
+        for alias, conf in TICKER_ALIASES.get(t, {}).items():
+            if f" {alias} " in ntext and (best is None or conf > best[1]):
+                best = (t, conf, alias)
+        if best:
+            hits.append(best)
+    return hits
 
 
 def recency_points(age_min: float) -> int:
@@ -699,8 +880,7 @@ def fetch_stockbit_fallback(sym: str, timeout: int = 25) -> list[dict]:
 
 def breaking_once() -> dict:
     """Poll RSS sources, score items, persist candidates, trigger stale flow."""
-    stats = {"sources_ok": 0, "candidates": 0, "triggered": 0, "errors": []}
-    ticker_map = {t: [t.lower()] for t in TICKERS}
+    stats = {"sources_ok": 0, "candidates": 0, "triggered": 0, "errors": [], "denial_suppressed": 0}
     for src in RSS_SOURCES:
         try:
             xml_bytes = fetch_url(src["url"])
@@ -712,10 +892,10 @@ def breaking_once() -> dict:
         for node in root.iter():
             if lname(node.tag) not in {"item", "entry"}:
                 continue
-            title = child_text(node, {"title"})
+            title = clean_text(child_text(node, {"title"}), 300)  # P2: strip tag/entity
             if not title:
                 continue
-            summary = child_text(node, {"description", "summary", "content", "encoded"})
+            summary = clean_text(child_text(node, {"description", "summary", "content", "encoded"}), 1200)
             link = child_link(node)
             pub_raw = child_text(node, {"pubdate", "published", "updated", "date"})
             try:
@@ -732,11 +912,48 @@ def breaking_once() -> dict:
             category = "Dividen" if is_div else "Lainnya"
 
             # --- skor & entity detection untuk SEMUA artikel (tanpa cut age) ---
-            tickers = detect_entities(full_text, ticker_map)
+            resolved = resolve_tickers(full_text)  # P3: cashtag + alias emiten
+            tickers_all = sorted({t for t, _, _ in resolved})
+            tickers = sorted({t for t, c, _ in resolved if c >= ENTITY_CONF_HIGH})
             sectors = detect_entities(full_text, SECTOR_ALIASES)
-            keywords = {k: v for k, v in IMPACT_KEYWORDS.items() if norm(k) in norm(full_text)}
-            score, _reasons = rule_score(published, float(src["priority"]), tickers, sectors, keywords)
+            ntext = norm(full_text)
+            keywords = {k: v for k, v in IMPACT_KEYWORDS.items() if norm(k) in ntext}
+            denial = denial_hits(ntext)  # P3.5
+            if denial and keywords:
+                keywords = {}
+                stats["denial_suppressed"] += 1
+            score, reasons = rule_score(published, float(src["priority"]), tickers, sectors, keywords)
             score = min(score, 100.0)
+            # semantic materiality (Cohere embed-v4.0): kedekatan makna artikel ke arketipe
+            # material vs non-material. Default PENDUKUNG (chip SEM; trigger
+            # tetap rule). By-context: kalau rule-nya "hampir" (>= ESCALATE_FLOOR
+            # tapi di bawah threshold) DAN semantic yakin material
+            # (margin >= ESCALATE_MARGIN, kalibrasi 40 pilot) -> skor dinaikin
+            # sedikit ke atas threshold supaya ikut jadi kandidat event.
+            # Guard: keyword material harus ada + gak sedang denial; sidecar
+            # mati -> None, pipeline jalan normal.
+            try:
+                sys.path.insert(0, BASE_DIR)
+                from ml.search.news_semantic import materiality_margin
+                sem_margin = materiality_margin(title, summary)
+            except Exception:  # noqa: BLE001
+                sem_margin = None
+            sem_label = ("material" if (sem_margin or 0) >= 0.20 else "non_material") \
+                if sem_margin is not None else None
+            sem_escalated = False
+            if (sem_margin is not None and CANDIDATE_THRESHOLD > score >= ESCALATE_FLOOR
+                    and sem_margin >= ESCALATE_MARGIN and keywords and not denial):
+                score = round(min(100.0, CANDIDATE_THRESHOLD + 1.0), 1)
+                sem_escalated = True
+                stats["sem_escalated"] = stats.get("sem_escalated", 0) + 1
+                reasons.append(
+                    f"semantic eskalasi: margin {sem_margin:+.2f} material by-context "
+                    f"(rule {ESCALATE_FLOOR:.0f}-{CANDIDATE_THRESHOLD:.0f})")
+            if denial:  # P3.5: dicatat di audit trail, bukan di skor
+                reasons.append(f"denial guard: {', '.join(denial)} -> keyword material disuppress")
+            if tickers_all != tickers:  # P3: transparansi tiering entity
+                med = sorted(set(tickers_all) - set(tickers))
+                reasons.append(f"entity tiering: {', '.join(med) or '-'} = confidence rendah (tanpa bonus skor)")
 
             # --- simpan semua artikel (window 48 jam) biar view News ramai ---
             url_hash = hashlib.sha1((link or title).encode()).hexdigest()
@@ -744,13 +961,14 @@ def breaking_once() -> dict:
                 c.execute(
                     "INSERT OR IGNORE INTO news_articles "
                     "(url_hash, source_name, source_url, title, summary, published_at, fetched_at,"
-                    " rule_score, tickers, sectors, keywords, category) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " rule_score, tickers, sectors, keywords, category, sem_margin, sem_label) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         url_hash, src["name"], link, title, (summary or "")[:400],
                         iso(published), iso(now_utc()), score,
-                        json.dumps(tickers), json.dumps(sectors), json.dumps(keywords),
+                        json.dumps(tickers_all), json.dumps(sectors), json.dumps(keywords),
                         category,
+                        sem_margin, sem_label,
                     ),
                 )
 
@@ -762,8 +980,9 @@ def breaking_once() -> dict:
                 continue
 
             ehash = hashlib.sha256(f"{norm(title)}|{link}".encode()).hexdigest()
-            # Rule-only validator proxy (demo): confidence scales with score.
-            confidence = round(min(0.9, 0.5 + score * 0.004), 2)
+            # Validator proxy (demo): confidence scales with score;
+            # eskalasi semantic dapet diskon kecil (bukan keputusan rule murni).
+            confidence = round(min(0.9, 0.5 + score * 0.004) - (0.05 if sem_escalated else 0.0), 2)
             severity = derive_severity(score, confidence)
             status = "CANDIDATE"
             if tickers and severity in ("HIGH", "CRITICAL"):
@@ -772,7 +991,7 @@ def breaking_once() -> dict:
             stats["candidates"] += 1
 
             with conn() as c:
-                c.execute(
+                inserted = c.execute(
                     "INSERT OR IGNORE INTO breaking_events "
                     "(event_hash, source_name, source_url, headline, published_at, detected_at,"
                     " rule_score, reasons, matched_keywords, tickers, sectors, confidence, severity, status) "
@@ -780,10 +999,12 @@ def breaking_once() -> dict:
                     (
                         ehash, src["name"], link, title, iso(published), iso(now_utc()),
                         score, json.dumps(reasons), json.dumps(keywords),
-                        json.dumps(tickers), json.dumps(sectors), confidence, severity, status,
+                        json.dumps(tickers_all), json.dumps(sectors), confidence, severity, status,
                     ),
-                )
-                if status == "TRIGGERED":
+                ).rowcount
+                # P0 idempotency: stale flag + timer reassess HANYA saat event benar2 baru,
+                # bukan tiap kali artikel yang sama keluar lagi di poll berikutnya
+                if status == "TRIGGERED" and inserted == 1:
                     for t in tickers:
                         c.execute(
                             "UPDATE recommendations SET stale=1, stale_reason='material_event',"
@@ -795,6 +1016,29 @@ def breaking_once() -> dict:
                         threading.Timer(
                             REASSESS_DELAY, simulate_reassessment, args=(ehash, tickers)
                         ).start()
+    # P0: retensi artikel 48 jam — news_articles gak bengkak.
+    # IndoBERT plan (Phase B): artikel yang mau di-prune di-archive dulu ke JSONL
+    # biar stok data buat labeling materiality gak nguap.
+    cutoff_news = iso(now_utc() - timedelta(hours=NEWS_RETENTION_H))
+    with conn() as c:
+        dying = [dict(r) for r in c.execute(
+            "SELECT * FROM news_articles WHERE published_at IS NOT NULL AND published_at < ?",
+            (cutoff_news,),
+        ).fetchall()]
+    if dying:
+        arch = os.path.join(BASE_DIR, "data", "news", "archive_news.jsonl")
+        os.makedirs(os.path.dirname(arch), exist_ok=True)
+        with open(arch, "a", encoding="utf-8") as f:
+            for a in dying:
+                f.write(json.dumps(a, ensure_ascii=False) + "\n")
+        stats["archived_news"] = len(dying)
+    with conn() as c:
+        del_news = c.execute(
+            "DELETE FROM news_articles WHERE published_at IS NOT NULL AND published_at < ?",
+            (cutoff_news,),
+        ).rowcount
+    if del_news:
+        stats["pruned_news"] = del_news
     HEALTH["rss"].update({
         "status": "ok" if stats["sources_ok"] else "down",
         "last_ok": iso(now_utc()) if stats["sources_ok"] else HEALTH["rss"]["last_ok"],
@@ -813,17 +1057,32 @@ def simulate_reassessment(ehash: str, tickers: list[str]) -> None:
                 continue
             delta = (int(hashlib.md5((ehash + t).encode()).hexdigest(), 16) % 7) - 3
             new_score = max(1, min(99, row["score"] + delta))
+            # P0: label ikut dihitung ulang bareng skor (dulu bisa skor 80 + label HOLD)
+            new_label = "BUY" if new_score >= 75 else ("WATCH" if new_score >= 65 else "HOLD")
             c.execute(
-                "UPDATE recommendations SET score=?, grade=?, stale=0,"
+                "UPDATE recommendations SET score=?, grade=?, label=?, stale=0,"
                 " reassessed_at=?, reassessed_note=? WHERE ticker=?",
                 (
                     new_score,
                     grade_for(new_score),
+                    new_label,
                     iso(now_utc()),
                     f"simulated targeted reassessment (delta {delta:+d})",
                     t,
                 ),
             )
+
+
+def reset_db() -> None:
+    """P0: reset LENGKAP — dulu sentiment_per_ticker & news_articles gak ikut kehapus (orphan)."""
+    with conn() as c:
+        c.executescript(
+            "DELETE FROM stream_post_tickers; DELETE FROM sentiment_predictions;"
+            " DELETE FROM sentiment_per_ticker; DELETE FROM news_articles;"
+            " DELETE FROM stream_posts; DELETE FROM breaking_events;"
+            " UPDATE recommendations SET stale=0, stale_reason=NULL, stale_event_hash=NULL,"
+            " stale_at=NULL, reassessed_at=NULL, reassessed_note=NULL;"
+        )
 
 
 def grade_for(score: int) -> str:
@@ -851,6 +1110,44 @@ def seed_recommendations() -> None:
 # --------------------------------------------------------------------------
 # API
 # --------------------------------------------------------------------------
+def _ml_status() -> dict:
+    """Status model IndoBERT opsional (IndoBERT plan bag. 25). Import-protected:
+    demo stdlib tetap jalan penuh walau torch/transformers gak terpasang."""
+    try:
+        sys.path.insert(0, BASE_DIR)
+        from ml import common
+        return {
+            "available": common.AVAILABLE,
+            "sentiment": common.status(common.os.path.join(common.MODELS_DIR, "indobert-stockbit-sentiment-v1")),
+            "materiality": common.status(common.os.path.join(common.MODELS_DIR, "indobert-news-materiality-v1")),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"available": False, "error": str(exc)}
+
+
+def _search_mode() -> dict:
+    """Status semantic search (import-protected, pola sama dengan _ml_status)."""
+    try:
+        sys.path.insert(0, BASE_DIR)
+        from ml import search as _search_mod
+        n = 0
+        try:
+            con = sqlite3.connect(DB_PATH)
+            n = con.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+            con.close()
+        except Exception:  # noqa: BLE001 — tabel belum ada
+            n = 0
+        if _search_mod.sidecar_available() and n > 0:
+            mode = "semantic (Cohere embed-v4.0 via API)"
+        elif n > 0:
+            mode = "keyword fallback (COHERE_API_KEY gak ada / API gagal, index tersedia)"
+        else:
+            mode = "keyword fallback (index kosong — jalankan scripts/build_embeddings_cohere.py)"
+        return {"mode": mode, "indexed": n}
+    except Exception as exc:  # noqa: BLE001
+        return {"mode": "keyword fallback (modul search tidak tersedia)", "error": str(exc)}
+
+
 def build_state() -> dict:
     with conn() as c:
         recs = [dict(r) for r in c.execute("SELECT * FROM recommendations ORDER BY score DESC")]
@@ -868,7 +1165,7 @@ def build_state() -> dict:
     with conn() as c:
         articles = [dict(r) for r in c.execute(
             "SELECT url_hash, source_name, source_url, title, summary, published_at,"
-            " rule_score, tickers, category FROM news_articles "
+            " rule_score, tickers, category, sem_margin, sem_label FROM news_articles "
             "ORDER BY published_at DESC LIMIT 40")]
         cat_counts = [dict(r) for r in c.execute(
             "SELECT category, COUNT(*) n FROM news_articles GROUP BY category")]
@@ -896,7 +1193,10 @@ def build_state() -> dict:
     return {
         "generated_at": iso(now_utc()),
         "mode": {
-            "sentiment_model": "lexicon-v2 per-cashtag (HEURISTIC, belum dikalibrasi)",
+            "sentiment_model": "lexicon-v3 per-cashtag + context rules; post per-ticker NEUTRAL di-resolve arah semantic kNN (sim>=0.75, k=3 sepakat, presisi ~60% di pilot 150) via model_version=semantic-knn-v1 (audit: tabel semantic_direction_log)",
+            "entity_resolution": "cashtag + alias nama emiten (confidence; >=0.8 dapat bonus skor)",
+            "ml_models": _ml_status(),
+            "search": _search_mode(),
             "validator": "rule-only proxy (LLM validator tidak aktif di demo)",
             "recommendations": "DEMO baseline dummy, bukan sinyal riil",
         },
@@ -992,7 +1292,29 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._json({"event": ev})
             elif path == "/api/health":
                 self._json(build_state()["health"])
+            elif path == "/api/search":
+                params = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                q = (params.get("q", [""])[0] or "").strip()
+                if not q:
+                    self._json({"error": "parameter q wajib"}, 400)
+                    return
+                kinds_raw = params.get("kinds", [None])[0]
+                kinds = [k.strip() for k in kinds_raw.split(",") if k.strip()] if kinds_raw else None
+                try:
+                    limit = min(max(int(params.get("limit", ["20"])[0]), 1), 50)
+                except ValueError:
+                    limit = 20
+                try:
+                    sys.path.insert(0, BASE_DIR)
+                    from ml.search import search as _search_fn
+                    self._json(_search_fn(q, top_k=limit, kinds=kinds))
+                except Exception as exc:  # noqa: BLE001
+                    self._json({"error": f"search gagal: {exc}"}, 500)
             elif path == "/api/chatter":
+                tkr_req = self.path.rsplit("ticker=", 1)[-1].split("&")[0].upper()
+                if not re.fullmatch(r"[A-Z]{4}", tkr_req):  # P2: input validation
+                    self._json({"error": "ticker tidak valid"}, 400)
+                    return
                 with conn() as c:
                     rows = [dict(r) for r in c.execute(
                         "SELECT sp.postid, sp.text_original AS text, sp.created_at_utc AS created_at, "
@@ -1002,12 +1324,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                         "JOIN stream_post_tickers spt ON spt.postid = sp.postid "
                         "LEFT JOIN sentiment_per_ticker spv "
                         "  ON spv.postid = sp.postid AND spv.ticker = spt.ticker "
-                        " AND spv.model_version = 'lexicon-v2' "
+                        " AND spv.model_version = 'lexicon-v3' "
                         "LEFT JOIN sentiment_predictions sen "
                         "  ON sen.postid = sp.postid AND sen.model_version = 'lexicon-demo-v1' "
                         "WHERE spt.ticker = ? AND sp.created_at_utc IS NOT NULL "
                         "ORDER BY sp.created_at_utc DESC LIMIT 25",
-                        (self.path.rsplit("ticker=", 1)[-1].split("&")[0].upper(),),
+                        (tkr_req,),
                     )]
                 out = []
                 for p in rows:
@@ -1025,6 +1347,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                     out.append(p)
                     if len(out) >= 12:
                         break
+                # Semantic direction hint (PENDUKUNG): buat post neutral,
+                # cocokin ke pool post berlabel jelas (cosine >= 0.75, k=3,
+                # wajib sepakat). Sidecar mati -> tanpa hint, chatter jalan normal.
+                try:
+                    sys.path.insert(0, BASE_DIR)
+                    from ml.search.chatter_direction import semantic_direction
+                    for p in out:
+                        if (p.get("sentiment") or "neutral") == "neutral":
+                            hint = semantic_direction(p.get("text") or "")
+                            if hint:
+                                p["semantic_hint"] = hint
+                except Exception:  # noqa: BLE001 — hint bersifat opsional
+                    pass
                 self._json({"posts": out})
             else:
                 self._json({"error": "unknown endpoint"}, 404)
@@ -1039,13 +1374,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                 b = breaking_once()
                 self._json({"collector": s, "breaking": b})
             elif path == "/api/reset":
-                with conn() as c:
-                    c.executescript(
-                        "DELETE FROM stream_post_tickers; DELETE FROM sentiment_predictions;"
-                        " DELETE FROM stream_posts; DELETE FROM breaking_events;"
-                        " UPDATE recommendations SET stale=0, stale_reason=NULL, stale_event_hash=NULL,"
-                        " stale_at=NULL, reassessed_at=NULL, reassessed_note=NULL;"
-                    )
+                reset_db()
                 seed_recommendations()
                 self._json({"ok": True})
             elif path == "/api/simulate_event":
@@ -1135,12 +1464,80 @@ def selftest() -> int:
     check("v2 per-cashtag BBCA bearish", v2b is not None and v2b[0] == "bearish" and v2b[1] < 0)
     check("v2 slang 'anjloooq' kebaca", sentiment_score("$GOTO anjloooq parah")[0] == "bearish")
     check("v2 tanpa cashtag -> None", sentiment_for_ticker("naik terus cuan parah", "BBCA") is None)
+    from ml.search.chatter_direction import resolve_direction
+    check("resolve passthrough (bukan neutral)",
+          resolve_direction(1, "BBCA", "apa aja", "bullish", 0.5) == ("bullish", 0.5, "lexicon-v3"))
     s, r = rule_score(now_utc() - timedelta(minutes=2), 1.0, ["ANTM"], ["Basic Materials"], {"produksi dihentikan": 24})
     check("rule score material > plain", s >= 45 and any("hard-event" in x for x in r))
     s_plain, _ = rule_score(now_utc() - timedelta(minutes=2), 1.0, ["ANTM"], [], {})
     check("material > plain", s > s_plain)
     check("severity derive", derive_severity(60, 0.74) == "HIGH")
     check("author hash stable", author_hash("a") == author_hash("a") and author_hash("a") != author_hash("b"))
+
+    # ---- Phase 1 regression: correctness DB (pakai DB sementara, gak nyentuh demo.db) ----
+    global DB_PATH
+    import tempfile
+    _db_old, DB_PATH = DB_PATH, os.path.join(tempfile.mkdtemp(prefix="mf_selftest_"), "t.db")
+    try:
+        init_db()
+        with conn() as c:
+            c.execute("INSERT OR IGNORE INTO breaking_events (event_hash, status) VALUES ('h1','TRIGGERED')")
+            rc_dup = c.execute(
+                "INSERT OR IGNORE INTO breaking_events (event_hash, status) VALUES ('h1','TRIGGERED')"
+            ).rowcount
+        check("P0 event idempotent (dup -> rowcount 0)", rc_dup == 0)
+        try:
+            with conn() as c:
+                c.execute("INSERT INTO stream_post_tickers (postid, ticker) VALUES (987654, 'BBCA')")
+            fk_ok = False
+        except sqlite3.IntegrityError:
+            fk_ok = True
+        check("P0 foreign keys ON (orphan ditolak)", fk_ok)
+        with conn() as c:
+            c.execute("INSERT OR REPLACE INTO recommendations (ticker, score, grade, label) VALUES ('TEST', 80, 'A', 'HOLD')")
+        simulate_reassessment("h1", ["TEST"])
+        with conn() as c:
+            rr = c.execute("SELECT score, label FROM recommendations WHERE ticker='TEST'").fetchone()
+        exp_label = "BUY" if rr["score"] >= 75 else ("WATCH" if rr["score"] >= 65 else "HOLD")
+        check("P0 reassessment label ikut skor", rr["label"] == exp_label)
+        reset_db()
+        with conn() as c:
+            leftover = c.execute(
+                "SELECT (SELECT COUNT(*) FROM stream_posts) + (SELECT COUNT(*) FROM news_articles)"
+                " + (SELECT COUNT(*) FROM sentiment_per_ticker) + (SELECT COUNT(*) FROM breaking_events)"
+            ).fetchone()[0]
+        check("P0 reset bersih semua tabel", leftover == 0)
+    finally:
+        DB_PATH = _db_old
+
+    # ---- Phase 2 regression: security ----
+    sp = sanitize_post({"postid": 1, "username": "budi", "avatar": "x.png", "likes": 3})
+    check("P2 sanitize buang username/avatar", "username" not in sp and "avatar" not in sp and sp["likes"] == 3)
+    check("P2 sanitize nested dict", "user" not in sanitize_post({"likes": 1, "user": {"username": "x"}}))
+    check("P2 clean_text strip tag+entity", clean_text("<b>PT &amp; Anak</b> Cilegon<br>Rudi") == "PT & Anak Cilegon Rudi")
+    check("P2 clean_text limit 300", len(clean_text("a" * 5000, 300)) == 300)
+
+    # ---- P3.5 regression: context rules ----
+    l, s, _ = sentiment_score("$BBCA gak rugi kok malah cuan")
+    check("P3.5 intent-flip 'gak rugi' -> bullish", l == "bullish" and s > 0)
+    check("P3.5 frasa 'gap down' kebaca", sentiment_score("$BBCA gap down parah")[0] == "bearish")
+    check("P3.5 frasa 'back to mahkota' kebaca", sentiment_score("$BBCA back to mahkota gacor")[0] == "bullish")
+    check("P3.5 'gak naik' -> bearish", sentiment_score("$GOTO gak naik gak")[0] == "bearish")
+    check("P3.5 denial 'membantah isu pailit'", "membantah" in denial_hits(norm("perusahaan membantah isu pailit")))
+    check("P3.5 denial 'belum dikonfirmasi'", "belum dikonfirmasi" in denial_hits(norm("rumor suspensi belum dikonfirmasi")))
+
+    # ---- P3 regression: entity resolver ----
+    r = resolve_tickers("antam tembus rekor produksi emas")
+    check("P3 alias 'antam' -> ANTM high", any(t == "ANTM" and c >= 0.8 for t, c, _ in r))
+    r = resolve_tickers("bank central asia catat laba melonjak")
+    check("P3 'bank central asia' -> BBCA 0.95", any(t == "BBCA" and c >= 0.9 for t, c, _ in r))
+    check("P3 substring aman ('bri' gak nyangkut)", resolve_tickers("perpustakaan nalibrinya") == [])
+    r = resolve_tickers("$antm naik")
+    check("P3 cashtag conf 1.0", bool(r) and r[0][0] == "ANTM" and r[0][1] == 1.0)
+    check("P3 'telkomsel' -> TLKM", any(t == "TLKM" for t, _, _ in resolve_tickers("telkomsel perkuat jaringan")))
+    check("P3 tiering 'bumi' 0.6 gak high", [t for t, c, _ in resolve_tickers("bumi terlihat indah") if c >= 0.8] == [])
+    check("P3 'gojek' -> GOTO high", any(t == "GOTO" and c >= 0.8 for t, c, _ in resolve_tickers("gojek garap fitur baru")))
+
     print("SELFTEST:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 
@@ -1164,8 +1561,8 @@ def main() -> int:
 
     if not args.no_rss:
         threading.Thread(target=breaking_loop, daemon=True).start()
+    # P0: SATU collector cukup — dulu ada 2 thread nyangkut, poll dobel saat startup
     threading.Thread(target=collector_loop, daemon=True).start()
-    threading.Thread(target=lambda: (time.sleep(1), collect_once()), daemon=True).start()
 
     httpd = None
     port = PORT

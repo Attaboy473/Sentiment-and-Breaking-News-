@@ -1,150 +1,139 @@
-# MarketForge Demo — Sentiment & Breaking News
+# MarketForge Demo — Sentiment & Breaking News Engine (IDX)
 
-Demo **standalone** dari `MarketForge_Complete_Project_Bundle`: pipeline **sentiment komunitas Stockbit** + **breaking news engine** untuk emiten IDX, dalam **satu file Python tanpa dependency** (stdlib + SQLite saja). Satu perintah jalan.
+Demo pipeline analisis sentimen retail **Stockbit** + deteksi **breaking news** emiten Indonesia.
+Satu perintah jalan, stdlib Python murni — kecerdasan makna (semantic) via **Cohere embed-v4.0**,
+semua keputusan bisa diaudit.
 
-> ⚠️ **Ini demo/edukasi, bukan saran investasi.** Sentiment = heuristik lexicon yang *belum dikalibrasi*, papan rekomendasi = baseline dummy, LLM validator = rule proxy. Semua mode kejujuran ini tampil di dalam app (health bar "Mode").
+> ⚠️ **DEMO / PROTOTIPE** — bukan sinyal beli-jual. Rekomendasi di board = baseline dummy.
 
 ---
 
-## Quick Start
+## Apa yang dikerjain sistem ini
 
-```bash
-python app.py              # jalan di http://127.0.0.1:8004/ (RSS breaking news aktif)
-python app.py --no-rss     # tanpa RSS (hanya collector Stockbit)
-python app.py --selftest   # 11 unit check tanpa nyalain server
+```
+Stockbit stream ──► Collector ──► Sentiment Engine ──► Agregat per-ticker ──► UI Dashboard
+RSS berita (IDX) ──► News Engine ────► Breaking Event ────► Flag stale rekomendasi
+                              │
+Semantic Layer (Cohere v4) ───┴──► 1. Arah post neutral (≈bullish/bearish)
+                                   2. Materiality berita (sem_margin)
+                                   3. Search post+berita by makna
 ```
 
-Kebutuhan: **Python 3.10+** — tanpa pip, tanpa Docker, tanpa Postgres. Database SQLite (`demo.db`) dibuat otomatis.
+### 1. Sentiment (per-cashtag)
 
----
-
-## 1. Sentiment Komunitas Stockbit
-
-### Cara datangnya
-- **Collector** poll `GET https://exodus.stockbit.com/stream/non-login/symbol/{SYM}` — endpoint publik hasil riset feasibility (tanpa login, tanpa header khusus, window 30 post terakhir per ticker).
-- 10 ticker watchlist dipoll bergiliran (stagger 1.5s), **dedupe by `postid`**, penulis dianonymisasi jadi `sb:<hash>` (username tidak pernah disimpan).
-- **Fallback otomatis**: kalau API gagal, collector ambil 30 post yang sama dari halaman SSR `stockbit.com/symbol/{SYM}` via `__NEXT_DATA__` (temuan riset; error & status fallback transparan di health bar).
-- **Filter noise**: post dari akun resmi emiten (`official`), repost riset broker (`isreport`), berita otomatis (`isnews`), dan post terlalu pendek (<12 char / emoji-only) **dibuang dari agregat** — jumlah yang dibuang tampil di kolom "Filter".
-
-### Cara dinilai (lexicon v2, per-cashtag)
-1. **Segmentasi per-cashtag** — post multi-ticker tidak lagi "sama rata". Teks dipecah per `$TICKER`: kata setelah `$TICKER` jadi milik ticker itu sampai cashtag berikutnya. Contoh: *"$BUMI gacor naik terus, $BBCA anjlok jeblok"* → BUMI **bullish**, BBCA **bearish**.
-2. **Lexicon ±30 kata slang** (cuan, gacor, ara, sokong, gemoy / anjlok, jeblok, potong bongkar, bocor cc, gap down, dll).
-3. **Normalisasi slang**: "naaaiiik" → naik, "anjloooq" → anjlok (termasuk leetspeak q→k), huruf berulang dirapikan.
-4. **Intensifier** (banget/gila/parah/sangat…) memperbesar bobot 1.2–1.5×; **negator** 2 kata sebelum keyword (gak/ga/tidak/jangan/bukan…) membalik arah.
-5. Skor = `(bull − bear) / (bull + bear)` → label **bullish** (≥ +0.34) / **bearish** (≤ −0.34) / neutral. Setiap skor disimpan dengan `model_version` (`lexicon-v2` per-ticker, `lexicon-demo-v1` whole-post) supaya ganti model tinggal re-score tanpa kolek ulang.
-
-### Metrik agregat (per ticker, window 1 jam & 24 jam)
-| Kolom | Arti |
-|---|---|
-| Mention | jumlah post (sudah lewat filter noise) |
-| Bull/Bear | distribusi label |
-| Net | net sentiment −100..+100 |
-| Authors | author unik (hash) |
-| Velocity | perubahan mention vs window sebelumnya — hanya dihitung kalau window sebelumnya ≥3 post (guard anti "plus 6500%") |
-| Fresh | umur post terbaru (ijo ≤1 jam, kuning ≤3 jam, abu = basi) |
-| Filter | jumlah post noise yang dibuang |
-| Engage | bar engagement (1 + likes + replies) |
-
-Ticker dengan sample <5 post ditandai **"sample tipis"** dan ditampilkan redup — jangan dinilai.
-
-**Sektor Watchlist**: rollup tematik 24 jam (Bank, Energi, Logam & Mineral, Telko, Teknologi) dari post yang sudah terfilter — disclaimer: bukan klasifikasi board IDX resmi.
-
----
-
-## 2. Breaking News Engine
-
-### Filosofi: klasifikasi DAMPAK, bukan topik
-Sumber: RSS **ANTARA Bursa & Finansial** (2 feed, poll tiap `DEMO_BREAKING_INTERVAL` detik). Semua artikel ≤48 jam disimpan & ditampilkan; yang berimbas tinggi jadi event.
-
-**Rule score 0–100 yang explainable** (bisa dibongkar per alasan di modal audit trail):
-- **Recency**: makin baru makin tinggi (hard cut: item >3 jam tidak jadi kandidat)
-- **Source priority**: bobot kredibilitas feed
-- **Entity**: ada nama emiten / sektor yang dikenali → naik
-- **Impact keywords berbobot** (contoh): pailit 30 · suspensi/fraud 28 · delisting 26 · izin dicabut/ledakan 25 · korupsi/merger/produksi dihentikan 24 · akuisisi/kebakaran 22 · rights issue/kontrak jumbo 20 · buyback/MSCI/laba melonjak-anjlok 18 · dividen 14
-- **HARD_EVENTS** (8 keyword paling parah: suspensi, pailit, gagal bayar, fraud, delisting, izin dicabut, produksi dihentikan, ledakan) → auto HIGH/CRITICAL
-
-**Alur material event** (sesuai plan bundle §8):
-1. Score **≥45** → kandidat event (badge CANDIDATE)
-2. **HIGH/CRITICAL + ada emiten** → TRIGGERED → rekomendasi emiten terdampak di-flag **STALE** (bukan sinyal baru — cuma tanda "info lama sudah tidak valid")
-3. **Targeted reassessment** disimulasikan ±20 detik → rekomendasi dapat skor & catatan baru, audit trail lengkap (klik kartu event: breakdown skor, reasons JSON, affected rekomendasi)
-
-**News Hub** juga menampilkan: semua artikel dengan **skor relevansi** + kategori (Dividen/Lainnya) ala News Preview, chip filter, dan **Chatter Stockbit** (12 post retail terbaru per ticker, dengan link "Buka di Stockbit" ke post aslinya sebagai bukti data). Klik nama emiten di tabel sentiment → langsung lompat ke stream emiten itu.
-
----
-
-## Parameter Utama
-
-| Parameter | Default | Di mana |
+| Lapisan | Engine | Kapan |
 |---|---|---|
-| Watchlist | BBCA, BBRI, BMRI, TLKM, ANTM, INCO, ADRO, BUMI, GOTO, UNTR | `TICKERS` di `app.py` |
-| Stagger antar ticker | 1.5 s | `collect_once()` |
-| Breaking poll interval | 60 s (`DEMO_BREAKING_INTERVAL` env) | `BREAKING_INTERVAL` |
-| Window berita tersimpan | 48 jam | `breaking_once()` |
-| Threshold kandidat event | score ≥ 45 | `CANDIDATE_THRESHOLD` |
-| Max umur item kandidat | 3 jam | `MAX_ITEM_AGE_MIN` |
-| Retensi post | 14 hari (auto-prune tiap poll) | `collect_once()` |
-| Window agregat | 1 jam & 24 jam | tab di UI |
-| Minimal sample valid | 5 post | `sample_ok` |
-| Guard velocity | prev window ≥3 post | `aggregate()` |
-| Chatter per ticker | 12 post terbaru | `/api/chatter` |
-| Artikel di News Hub | 40 terbaru | `build_state()` |
-| Threshold label | bullish ≥ +0.34 / bearish ≤ −0.34 | lexicon v2 |
+| Label utama | **lexicon-v3** — kamus + aturan konteks (negasi, intensifier) | semua post |
+| **Direction resolver** | **Cohere kNN** ke 94 post berlabel (cosine ≥ 0.60, k=3 wajib sepakat, guard duplikat >0.99) | post yang rule nilai NEUTRAL |
+| Abstain | dibiarkan neutral | bukti lemah / API mati |
 
----
+Post yang ke-resolve dapat label `semantic-knn-v1` dan **ikut agregat** bull/bear per ticker.
+Semua keputusan tercatat di tabel `semantic_direction_log` (arah, sim, provider).
 
-## Fitur UI
+**Benchmark (150 post berlabel, LOO + dedup): presisi 83%** di kode produksi
+(12 flip, 10 benar) — vs tebak-bullish 33% dan MiniLM 60–67%.
 
-- Dua tampilan (drawer kanan, bisa keluar-masuk): **Sentiment** (papan rekomendasi + tabel komunitas + sektor) & **News** (News Hub + breaking events + chatter)
-- Design language resmi MarketForge: canvas tenang, satu biru aksi, traffic-light pills, Inter, mono untuk angka, **tanpa emoji**, mode **terang/gelap** (persist di `localStorage["mf.theme"]`)
-- Logo emiten dari CDN Stockbit; klik emiten → stream aslinya
-- Toast, modal audit trail (tutup via X / klik luar / Esc), selftest, health bar real-time
-- Reset DB dari UI (hapus data + seed ulang rekomendasi dummy)
+Contoh nyata: `"$BBCA rungkad padahal banknya kek lintah ngisep darah"` → lexicon bilang
+neutral → resolver: **≈ bullish** (klasik "harga turun, fondasi cuan" yang keyword engine
+gak akan pernah nangkep).
 
----
+### 2. Breaking News
 
-## Tech Stack
-
-| Layer | Teknologi |
-|---|---|
-| Backend | **Python stdlib saja**: `ThreadingHTTPServer`, `urllib`, `sqlite3`, `xml.etree`, `json`, `hashlib` |
-| Database | SQLite (`demo.db`) — tabel: `stream_posts`, `stream_post_tickers`, `sentiment_predictions`, `sentiment_per_ticker`, `breaking_events`, `news_articles`, `recommendations`, `settings` |
-| Frontend | Vanilla HTML/CSS/JS tanpa framework, design token dari `MarketForge-DESIGN.md` |
-| Data | Stockbit stream non-login (+ fallback SSR `__NEXT_DATA__`), RSS ANTARA |
-
-### API
-| Endpoint | Method | Fungsi |
+| Lapisan | Engine | Kapan |
 |---|---|---|
-| `/api/state` | GET | Semua state UI (agregat, events, articles, chatter stats, health) |
-| `/api/poll` | POST | Paksa poll Stockbit + RSS sekarang |
-| `/api/simulate_event` | POST | Simulasi material event (body: `{"ticker": "ANTM"}`) |
-| `/api/event/{hash}` | GET | Detail event + audit trail |
-| `/api/chatter?ticker=X` | GET | 12 post retail terbaru emiten X (+ URL post asli) |
-| `/api/health` | GET | Status collector & RSS |
-| `/api/reset` | POST | Reset database |
+| **Trigger event** | **rule engine** — keyword material + prioritas sumber + recency + entity tiering (skor ≥45, severity HIGH/CRITICAL) | keputusan utama |
+| Materiality semantic | **Cohere margin** — kedekatan makna ke 14 arketipe kejadian material (pailit, delisting, gagal bayar…) vs non-material → chip `SEM` di UI | semua artikel |
+| **Eskalasi by-context** | rule 40–45 (hampir lolos) + margin ≥ 0.20 + keyword material + tidak sedang bantahan → naik tipis ke atas threshold (confidence −0.05) | artikel "hampir" |
+
+Denial guard tetap jalan: *"X membantah kabar pailit"* **tidak** jadi event walau ada kata "pailit".
+
+### 3. Search by makna
+
+`/api/search?q=...` — dispatch otomatis:
+
+- query ticker (`bbca`, `$BBCA BBRI`) → **literal** (urut kecocokan → likes → terbaru)
+- query campuran (`bbca dividen`) → semantic + boost dokumen yang nyebut ticker
+- query makna (`pailit gak bisa bayar utang`) → semantic penuh (nemu "tenggelam", "delisting")
+
+Tanpa `COHERE_API_KEY`: fallback keyword otomatis (LIKE + skoring) — demo tetap jalan offline.
+
+---
+
+## Hasil benchmark (jujur, semua terukur di data sendiri)
+
+| Uji | Hasil | Keputusan |
+|---|---|---|
+| IndoBERT fine-tune (5-fold) | **kalah lexicon 3/4 fold** (0.267 vs 0.524; 0.227 vs 0.646) | ❌ dibatalkan |
+| kNN ganti-label penuh (LOO) | MiniLM 46.7%, Cohere 43.5% vs lexicon 56.7% | ❌ ditolak — embedding paham *topik*, bukan *stance* |
+| Direction resolver (neutral→arah) | **Cohere 83%** vs MiniLM 60–67% vs baseline 33% | ✅ jalan di produksi |
+| News materiality | Cohere 37/40 = setara lexicon | ✅ pendukung + eskalasi |
+| Warna kartu gambar → arah post | 43% (warna chart = masa lalu, stance = masa depan) | ❌ ditolak |
+
+Pola keputusan: **rule tetap raja; semantic dipakai persis di tempat terbukti menang.**
+
+---
+
+## Cara jalanin
+
+```bash
+# 1. (opsional, disarankan) set key Cohere — semantic aktif
+export COHERE_API_KEY=isi_key_lu          # Windows bash; jangan ditulis ke file!
+
+# 2. jalanin demo
+python app.py                             # → http://localhost:8004
+```
+
+Tanpa key: jalan normal, search → keyword fallback, direction resolver → abstain.
+
+**Index semantic** (sekali saja / saat data banyak berubah — butuh key):
+
+```bash
+.venv-ml/Scripts/python.exe scripts/build_embeddings_cohere.py   # index post+news
+.venv-ml/Scripts/python.exe scripts/build_pool_cohere.py         # pool direction (94 post berlabel)
+```
+
+**Selftest**: `python app.py --selftest` → `SELFTEST: PASS`
+
+---
+
+## Endpoint utama
+
+| Endpoint | Ket |
+|---|---|
+| `GET /` | Dashboard (rekomendasi, sentiment, news, events, chatter) |
+| `GET /api/state` | State lengkap + mode + health |
+| `POST /api/poll` | Poll Stockbit + RSS sekarang |
+| `GET /api/chatter?ticker=X` | 12 post retail terbaru (+ arah semantic post neutral) |
+| `GET /api/search?q=...` | Search post+berita (ticker/semantic/keyword otomatis) |
+| `GET /api/event/{hash}` | Detail event + audit trail |
+| `GET /api/health` | Status collector & RSS |
+| `POST /api/reset` | Reset DB |
 
 ---
 
 ## Struktur
 
 ```
-marketforge_demo/
-├── app.py            # backend: collector, sentiment v2, breaking engine, API (stdlib)
-├── static/
-│   ├── index.html    # layout 2 view + drawer + topbar
-│   ├── style.css     # design token MarketForge (light/dark)
-│   └── app.js        # state, render, interaksi
-└── README.md
+app.py                     # server stdlib + pipeline (collector, news, aggregate, API)
+ml/search/
+  embed_cohere.py          # client Cohere embed-v4.0 (stdlib urllib, key via env)
+  chatter_direction.py     # resolver arah post neutral (Cohere kNN + abstain + audit)
+  news_semantic.py         # materiality margin (14 arketipe)
+  search.py                # engine search: literal / semantic / keyword fallback
+scripts/
+  build_embeddings_cohere.py   # index post+news → tabel embeddings
+  build_pool_cohere.py         # pool post berlabel → tabel pool_vectors
+  bench_cohere_embed.py        # benchmark + kalibrasi threshold
+  bench_image_color.py         # benchmark warna kartu (ditolak, dokumentasi)
+data/
+  sentiment/annotation_pilot.csv   # 150 post berlabel (label + label pass-2)
+  news/annotation_pilot.csv        # 40 artikel berlabel material
+static/                    # UI vanilla JS (zero framework)
 ```
 
----
+## Batasan (yang harus lu tau)
 
-## Batasan & Etika (jujur, penting)
-
-1. **Lexicon belum dikalibrasi** — bahasa stream sangat slang/sarkasme; sebelum dipercaya, rencananya labeling manual 300–500 post lalu benchmark IndoBERT vs LLM (sesuai implementation review bundle).
-2. **Papan rekomendasi = dummy deterministik** (hash ticker) — cuma panggung untuk mendemokan alur STALE → reassess, bukan sinyal.
-3. **LLM validator = rule proxy**; pipeline aslinya memakai LiteLLM.
-4. Riset hanya **endpoint publik non-login** — tanpa bypass auth/anti-bot, tanpa kredensial, volume rendah. Username tidak disimpan (dihash).
-5. Sentiment diposisikan sebagai **indikator konfirmasi**, bukan sinyal utama.
-6. Bukan saran investasi.
-
-Latar riset lengkap (feasibility endpoint, playbook, response schema) ada di repo `Attaboy473/stockbit-stream-feasibility`.
+- Label acuan dibuat **satu annotator** (author repo) — bukan ground truth mutlak; 83% bisa geser ±10 poin di data baru.
+- Sample pilot kecil (150 post / 40 artikel) — threshold bisa di-kalibrasi ulang seiring data nambah.
+- Semantic **butuh internet + API key**; tanpa itu fitur makna off (demo tetap hidup, jadi rule murni).
+- Semua tabel keputusan semantic (`semantic_direction_log`) tersedia buat audit — evaluasi ulang kapan aja.

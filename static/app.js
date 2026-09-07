@@ -1,5 +1,8 @@
 /* MarketForge Demo frontend */
 const $ = (sel) => document.querySelector(sel);
+/* P2 security: string dari luar (RSS / Stockbit / error upstream) di-escape sebelum masuk HTML */
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const safeUrl = (u) => (typeof u === "string" && /^https?:\/\//i.test(u) ? esc(u) : null);
 let STATE = null;
 let WINDOW_H = 24;
 let NEWS_FILTER = "ALL";
@@ -34,26 +37,6 @@ function fmtTime(iso) {
 
 /* ---------- health ---------- */
 function renderHealth(h) {
-  const sb = $("#hcStockbit"), rs = $("#hcRss");
-  const map = [["hcStockbit", h.stockbit.status], ["hcRss", h.rss.status]];
-  for (const [id, st] of map) {
-    const el = document.getElementById(id);
-    el.classList.remove("ok", "down");
-    if (st === "ok") el.classList.add("ok");
-    else if (st === "down") el.classList.add("down");
-  }
-  $("#hcStockbitMeta").innerHTML =
-    `status <b>${h.stockbit.status}</b> · post terakhir poll: ${h.stockbit.posts ?? 0} · baru: ${h.stockbit.new ?? 0}` +
-    `<br>overlap antar-poll: ${h.stockbit.overlap ?? "—"}` +
-    (h.stockbit.last_error ? `<br><span class="net-neg">${h.stockbit.last_error}</span>` : "");
-  $("#hcRssMeta").innerHTML =
-    `status <b>${h.rss.status}</b> · source ok: ${h.rss.sources_ok ?? 0} · kandidat: ${h.rss.candidates ?? 0}` +
-    (h.rss.last_error ? `<br><span class="net-neg">${h.rss.last_error}</span>` : "");
-  $("#hcStore").innerHTML =
-    `${h.posts_in_store} post tersimpan · ${h.posts_sentiment_scored} ter-skor<br>` +
-    `watchlist: ${h.watchlist.length} ticker`;
-  $("#hcMode").innerHTML =
-    `${STATE.mode.sentiment_model}<br>${STATE.mode.validator}<br>${STATE.mode.recommendations}`;
   const ev = STATE.events || [];
   const trig = ev.filter((e) => e.status === "TRIGGERED").length;
   $("#sideStats").innerHTML =
@@ -68,11 +51,11 @@ function renderRecos(recs) {
   const el = $("#recoBoard");
   el.innerHTML = recs.map((r) => {
     let note = "";
-    if (r.stale) note = `<div class="stale-note">STALE — ${r.stale_reason || "material event"}</div>`;
-    else if (r.reassessed_at) note = `<div class="reassessed">Reassessed ${fmtTime(r.reassessed_at)} — ${r.reassessed_note || ""}</div>`;
+    if (r.stale) note = `<div class="stale-note">STALE — ${esc(r.stale_reason || "material event")}</div>`;
+    else if (r.reassessed_at) note = `<div class="reassessed">Reassessed ${fmtTime(r.reassessed_at)} — ${esc(r.reassessed_note || "")}</div>`;
     return `<div class="reco-card ${r.stale ? "stale" : ""}">
       ${r.stale ? '<span class="stale-tag">STALE</span>' : ""}
-      <div class="reco-ticker">${r.ticker}</div>
+      <div class="reco-ticker">${esc(r.ticker)}</div>
       <div class="reco-score">${r.score}</div>
       <div class="reco-label ${r.label}">${r.label} · grade ${r.grade}</div>
       ${note}
@@ -99,7 +82,7 @@ function renderSentiment(rows) {
       const freshTxt = fresh == null ? "—" : (fresh < 60 ? fresh + " mnt" : Math.round(fresh / 60) + " jam");
       const freshCls = fresh == null ? "" : (fresh <= 60 ? "fresh-ok" : (fresh <= 180 ? "fresh-mid" : "fresh-old"));
       return `<tr class="${thin ? "thin-sample" : ""}">
-        <td><span class="tkr" data-tkr="${r.ticker}" title="Klik: lihat stream asli ${r.ticker} di panel bawah News"><span class="tkr-logo"><img src="https://assets.stockbit.com/logos/companies/${r.ticker}.png" alt="" onerror="this.parentNode.style.display='none'"></span><b>${r.ticker}</b></span>${thin ? ' <span class="pill">sample tipis</span>' : ""}</td>
+        <td><span class="tkr" data-tkr="${esc(r.ticker)}" title="Klik: lihat stream asli ${esc(r.ticker)} di panel bawah News"><span class="tkr-logo"><img src="https://assets.stockbit.com/logos/companies/${esc(r.ticker)}.png" alt="" onerror="this.parentNode.style.display='none'"></span><b>${esc(r.ticker)}</b></span>${thin ? ' <span class="pill">sample tipis</span>' : ""}</td>
         <td>${r.mention_count}</td>
         <td>${r.bullish}/${r.bearish}</td>
         <td class="${netClass(r.net_sentiment)}">${r.net_sentiment > 0 ? "+" : ""}${r.net_sentiment}</td>
@@ -159,18 +142,19 @@ function renderEvents(events) {
       kws ? `Keyword material: ${kws}` : null,
       sectors ? `Sektor: ${sectors}` : null,
     ].filter(Boolean).join(" · ") || "Tidak ada keyword material yang match";
-    const title = e.source_url
-      ? `<a class="news-title" href="${e.source_url}" target="_blank" rel="noopener">${e.headline}</a>`
-      : `<div class="news-title">${e.headline}</div>`;
+    const href = safeUrl(e.source_url);
+    const title = href
+      ? `<a class="news-title" href="${href}" target="_blank" rel="noopener noreferrer">${esc(e.headline)}</a>`
+      : `<div class="news-title">${esc(e.headline)}</div>`;
     return `<div class="news-card status-${e.status}" data-hash="${e.event_hash}">
       <div class="news-main">
         ${title}
         <div class="news-meta">
           <span class="badge sev-${e.severity}">${e.severity}</span>
           <span class="badge status-${e.status}">${e.status}</span>
-          <span>${e.source_name}</span><span class="dotsep">·</span>
+          <span>${esc(e.source_name)}</span><span class="dotsep">·</span>
           <span>${relTime(e.published_at)} (${wibTime(e.published_at)})</span>
-          <span class="cashtags">${(e.tickers || []).map((t) => `<span class="cashtag">$${t}</span>`).join("")}</span>
+          <span class="cashtags">${(e.tickers || []).map((t) => `<span class="cashtag">$${esc(t)}</span>`).join("")}</span>
         </div>
         <div class="news-desc">${desc} · confidence ${e.confidence}</div>
       </div>
@@ -198,7 +182,7 @@ async function openEvent(ehash) {
        <td>${r.reassessed_at ? "reassessed " + fmtTime(r.reassessed_at) : "—"}</td></tr>`).join("");
     $("#mBody").innerHTML = `
       <div class="kv">
-        <b>Source</b><span>${e.source_name} ${e.source_url ? `— <a href="${e.source_url}" target="_blank" rel="noopener">link</a>` : ""}</span>
+        <b>Source</b><span>${esc(e.source_name)} ${safeUrl(e.source_url) ? `— <a href="${safeUrl(e.source_url)}" target="_blank" rel="noopener noreferrer">link</a>` : ""}</span>
         <b>Published</b><span>${fmtTime(e.published_at)}</span>
         <b>Detected</b><span>${fmtTime(e.detected_at)}</span>
         <b>Rule score</b><span>${e.rule_score}</span>
@@ -245,20 +229,22 @@ function renderArticles(articles) {
   const el = $("#articleList");
   if (!list.length) { el.innerHTML = '<div class="empty">Belum ada artikel — klik "Poll sekarang" untuk scan RSS.</div>'; return; }
   el.innerHTML = list.map((a) => {
-    const title = a.source_url
-      ? `<a class="news-title" href="${a.source_url}" target="_blank" rel="noopener">${a.title}</a>`
-      : `<div class="news-title">${a.title}</div>`;
+    const ahref = safeUrl(a.source_url);
+    const title = ahref
+      ? `<a class="news-title" href="${ahref}" target="_blank" rel="noopener noreferrer">${esc(a.title)}</a>`
+      : `<div class="news-title">${esc(a.title)}</div>`;
     const tick = (a.tickers || []).length
-      ? ` <span class="cashtags">${a.tickers.map((t) => `<span class="cashtag">$${t}</span>`).join("")}</span>` : "";
+      ? ` <span class="cashtags">${a.tickers.map((t) => `<span class="cashtag">$${esc(t)}</span>`).join("")}</span>` : "";
     return `<div class="news-card article">
       <div class="news-main">
         ${title}
         <div class="news-meta">
           <span class="badge cat-${a.category === "Dividen" ? "DIV" : "LAIN"}">${a.category}</span>
-          <span>${a.source_name}</span><span class="dotsep">·</span>
+          <span>${esc(a.source_name)}</span><span class="dotsep">·</span>
           <span>${relTime(a.published_at)} (${wibTime(a.published_at)})</span>${tick}
+          ${a.sem_margin != null ? `<span class="dotsep">·</span><span class="sem-chip" title="Kedekatan makna ke arketipe kejadian material (MiniLM, pendukung — bukan penentu trigger)">SEM ${a.sem_margin >= 0 ? "+" : ""}${a.sem_margin.toFixed(2)} ${a.sem_label === "material" ? "material" : "non-material"}</span>` : ""}
         </div>
-        ${a.summary ? `<div class="news-desc">${a.summary.slice(0, 160)}…</div>` : ""}
+        ${a.summary ? `<div class="news-desc">${esc(a.summary.slice(0, 160))}…</div>` : ""}
       </div>
       <div class="news-score">
         <span class="score-label">Relevansi</span>
@@ -296,7 +282,7 @@ async function showTickerStream(ticker) {
   const sel = $("#chatterTicker");
   if (sel && [...sel.options].some((o) => o.value === ticker)) sel.value = ticker;
   const head = $("#chatterHead");
-  if (head) head.innerHTML = `Stream asli <span class="tkr-logo"><img src="https://assets.stockbit.com/logos/companies/${ticker}.png" alt="" onerror="this.parentNode.style.display='none'"></span><b>$${ticker}</b> <span class="muted">(12 post terbaru, dari collector)</span>`;
+  if (head) head.innerHTML = `Stream asli <span class="tkr-logo"><img src="https://assets.stockbit.com/logos/companies/${esc(ticker)}.png" alt="" onerror="this.parentNode.style.display='none'"></span><b>$${esc(ticker)}</b> <span class="muted">(12 post terbaru, dari collector)</span>`;
   try {
     await loadChatter();
     document.querySelector("#chatterTicker").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -311,16 +297,22 @@ async function loadChatter() {
   try {
     const j = await api("/api/chatter?ticker=" + ticker);
     const el = $("#chatterList");
-    el.innerHTML = j.posts.map((p) => `
-      <div class="chatter-post">
+    el.innerHTML = j.posts.map((p) => {
+      const h = p.semantic_hint;
+      const hint = h
+        ? `<div class="chatter-hint" title="Semantic: post ini mirip ${h.matches.length} post beropini yang sepakat arah (cosine >= 0.75). Hint makna — bukan pengganti label lexicon.">≈ ${esc(h.direction)} <span class="hint-sim">· mirip ${Math.round(h.sim * 100)}% · contoh: ${esc(h.matches[0].snippet.slice(0, 60))}</span></div>`
+        : "";
+      return `<div class="chatter-post">
         <div class="chatter-top">
-          <span class="chatter-author">${p.author}</span>
-          <span class="badge sent-${p.sentiment || "neutral"}">${p.sentiment || "neutral"}</span>
+          <span class="chatter-author">${esc(p.author)}</span>
+          <span class="badge sent-${h ? h.direction : (p.sentiment || "neutral")}">${h ? "≈ " + h.direction : (p.sentiment || "neutral")}</span>
           <span class="chatter-time">${relTime(p.created_at)} · ${p.likes} suka · ${p.replies} balasan</span>
-          ${p.url ? `<a class="chatter-link" href="${p.url}" target="_blank" rel="noopener" title="Buka post asli di Stockbit — bukti datanya beneran dari stream">Buka di Stockbit</a>` : ""}
+          ${safeUrl(p.url) ? `<a class="chatter-link" href="${safeUrl(p.url)}" target="_blank" rel="noopener noreferrer" title="Buka post asli di Stockbit — bukti datanya beneran dari stream">Buka di Stockbit</a>` : ""}
         </div>
-        <div class="chatter-text">${(p.text || "").slice(0, 220)}</div>
-      </div>`).join("") || '<div class="empty">Belum ada post untuk ticker ini.</div>';
+        <div class="chatter-text">${esc((p.text || "").slice(0, 220))}</div>
+        ${hint}
+      </div>`;
+    }).join("") || '<div class="empty">Belum ada post untuk ticker ini.</div>';
   } catch (err) { $("#chatterList").innerHTML = `<div class="empty">Gagal load chatter: ${err.message}</div>`; }
 }
 
@@ -335,6 +327,55 @@ function initChatterSelector() {
   sel.addEventListener("change", loadChatter);
   loadChatter();
 }
+
+/* ---------- semantic search ---------- */
+function renderSearch(j) {
+  const el = $("#searchResults");
+  const modeEl = $("#searchMode");
+  if (modeEl) {
+    modeEl.textContent = j.mode === "semantic" ? "(semantic)" :
+      j.mode === "literal" ? "(ticker)" :
+      j.mode === "keyword" ? "(fallback kata kunci)" : "";
+  }
+  if (!j.results || !j.results.length) {
+    el.innerHTML = '<div class="empty">Gak ada hasil. Coba kata lain.</div>';
+    return;
+  }
+  el.innerHTML = j.results.map((r) => {
+    const pct = Math.round((r.score || 0) * 100);
+    if (r.kind === "news") {
+      const href = safeUrl(r.source_url);
+      const title = r.title || r.snippet;
+      return `<div class="search-item">
+        <div class="search-top"><span class="search-kind news">BERITA</span><span class="search-score">mirip ${pct}%</span></div>
+        ${href ? `<a class="news-title" href="${href}" target="_blank" rel="noopener noreferrer">${esc(title)}</a>` : `<div class="news-title">${esc(title)}</div>`}
+        <div class="search-meta">${esc(r.source || "")}${r.published_at ? " · " + relTime(r.published_at) : ""}</div>
+      </div>`;
+    }
+    return `<div class="search-item">
+      <div class="search-top"><span class="search-kind post">POST</span><span class="search-score">mirip ${pct}%</span></div>
+      <div class="search-snippet">${esc(r.snippet || "")}</div>
+      <div class="search-meta">${r.created_at ? relTime(r.created_at) : ""}${r.likes ? " · " + r.likes + " suka" : ""}</div>
+    </div>`;
+  }).join("");
+}
+
+async function doSearch(q) {
+  if (!q || !q.trim()) return;
+  const el = $("#searchResults");
+  el.innerHTML = '<div class="empty">Nyari…</div>';
+  setView("search");
+  try {
+    const j = await api("/api/search?q=" + encodeURIComponent(q.trim()) + "&limit=15");
+    renderSearch(j);
+  } catch (err) {
+    el.innerHTML = `<div class="empty">Search gagal: ${err.message}</div>`;
+  }
+}
+$("#searchForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  doSearch($("#searchInput").value);
+});
 
 /* ---------- sidebar view switching ---------- */
 function setView(v) {
