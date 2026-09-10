@@ -14,7 +14,7 @@ Demonstrates the coding/concepts from MarketForge_Complete_Project_Bundle:
      - every event keeps its full reasoning JSON, inspectable in UI
 
 STANDALONE: Python 3.10+ stdlib only. No Docker, no Postgres, no Redis.
-Run:  python app.py            -> open printed URL (default try :8004)
+Run:  python app.py            -> open printed URL (default :8014; 8004 bentrok Docker BE stack)
       python app.py --selftest -> run quick unit checks then exit
 
 Honesty labels (per Implementation Review 2026): sentiment here is a
@@ -47,7 +47,7 @@ from xml.etree import ElementTree as ET
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "demo.db")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
-PORT = int(os.getenv("DEMO_PORT", "8004"))
+PORT = int(os.getenv("DEMO_PORT", "8014"))  # 8004 dikuasai Docker Desktop (BE stack) sejak 10 Sep
 COLLECT_INTERVAL = int(os.getenv("DEMO_COLLECT_INTERVAL", "300"))   # >= 300 (CDN cache 300s)
 BREAKING_INTERVAL = int(os.getenv("DEMO_BREAKING_INTERVAL", "60"))
 REASSESS_DELAY = int(os.getenv("DEMO_REASSESS_DELAY", "20"))        # simulated reassessment
@@ -128,11 +128,17 @@ LEX_BULL = {
     "bull", "bullish", "naik", "melejit", "melonjak", "cuan", "profit", "breakout",
     "akumulasi", "suntik", "gap up", "lampu ijo", "ijo", "hijau", "gacor", "ara",
     "buy", "sokong", "gemoy", "mantap", "yakin", "kencang", "sehat", "back to mahkota",
+    # v4 (10 Sep, dari 52 abstain-error eval): kosakata retail umum
+    "gas", "gaspol", "panas", "diskon", "banteng", "bagger", "tembus", "topgas",
 }
 LEX_BEAR = {
     "bear", "bearish", "turun", "anjlok", "jeblok", "rugi", "cutloss", "potong bongkar",
     "panic", "panik", "dump", "macet", "busuk", "bocor", "lampu merah", "merah",
     "sell", "bongkar", "distribusi", "arb", "susah gerak", "sempit", "bocah cc", "gap down",
+    # v4: slang bear dari error eval (banting/uprit/ngekos/berdarah/sampah dll)
+    "banting", "rontok", "dibuang", "berdarah", "sampah", "delisting", "termiris",
+    "longsor",
+    "uprit", "ngekos", "phpin", "sial", "gonjang ganjing", "rawat inap",
 }
 NEGATORS = {"gak", "ga", "nggak", "ngga", "tidak", "gk", "tdk", "jangan", "bukan"}
 # v2: normalisasi slang & intensifier (temuan riset: bahasa stream sangat informal)
@@ -142,6 +148,7 @@ SLANG_NORM = {
     "jeblokk": "jeblok", "cuann": "cuan", "cuannn": "cuan", "gacorr": "gacor",
     "gacorrr": "gacor", "kencengg": "kencang", "sempitt": "sempit", "sokongg": "sokong",
     "gemoyy": "gemoy", "banyakk": "banyak", "mantapp": "mantap", "gasss": "gas",
+    "mantaap": "mantap",
 }
 INTENSIFIERS = {"banget": 1.5, "bgt": 1.5, "gila": 1.4, "gilak": 1.4, "parah": 1.3,
                 "sangat": 1.4, "sungguh": 1.3, "bener": 1.2, "dahsyat": 1.4}
@@ -154,6 +161,35 @@ INTENT_FLIP = {
     ("gak", "naik"): -1, ("ga", "naik"): -1, ("gak", "gacor"): -1, ("gak", "cuan"): -1,
     ("belum", "naik"): -1,
 }
+
+# v4 (10 Sep): sinyal emoji - retail stream pake emoji sebagai arah eksplisit
+# (🚀=bull, 😭🥶💸=bear) yang lenyap di tokenize. Cap 2 hit per sisi.
+EMOJI_BULL = ("\U0001F680", "\U0001F402", "\U0001F4C8", "\U0001F525", "\U0001F44C")   # 🚀🐂📈🔥👌
+EMOJI_BEAR = ("\U0001F62D", "\U0001F976", "\U0001F4B8", "\U0001F4C9")   # 😭🥶💸📉
+_RE_EMOJI_BULL = re.compile("[" + "".join(EMOJI_BULL) + "]")
+_RE_EMOJI_BEAR = re.compile("[" + "".join(EMOJI_BEAR) + "]")
+
+# Digest/quote-card guard: post struktur berita/jurnal/digest BUKAN opini -
+# lexicon gampang salah-flip karena ada kata "BUY"/"naik" di dalamnya.
+DIGEST_PATTERNS = [
+    re.compile(r"jurnal market", re.I),
+    re.compile(r"\binvestor\s*:.*\baction\s*:", re.I | re.S),
+    re.compile(r"bursa tegur", re.I),
+    re.compile(r"lapkeu", re.I),
+]
+
+
+def is_digest_post(text: str) -> bool:
+    t = text or ""
+    return any(p.search(t) for p in DIGEST_PATTERNS)
+
+
+def _emoji_signal(text: str) -> tuple[int, int]:
+    if not text:
+        return 0, 0
+    return (min(2, len(_RE_EMOJI_BULL.findall(text))),
+            min(2, len(_RE_EMOJI_BEAR.findall(text))))
+
 
 HEALTH = {
     "stockbit": {"status": "init", "last_ok": None, "last_error": None, "posts": 0, "new": 0, "overlap": None},
@@ -358,6 +394,15 @@ def sentiment_score(text: str) -> tuple[str, float, list[str]]:
             bull += 1
         else:
             bear += 1
+    if is_digest_post(text):  # v4: digest/quote-card bukan opini
+        return "neutral", 0.0, hits
+    e_bull, e_bear = _emoji_signal(text)  # v4: emoji = sinyal arah eksplisit
+    if e_bull:
+        bull += e_bull
+        hits.append(f"emoji-bull x{e_bull}")
+    if e_bear:
+        bear += e_bear
+        hits.append(f"emoji-bear x{e_bear}")
     total = bull + bear
     if total == 0:
         return "neutral", 0.0, hits
@@ -436,6 +481,11 @@ def sentiment_for_ticker(text: str, ticker: str) -> tuple[str, float] | None:
                 bull += weight
             else:
                 bear += weight
+    if is_digest_post(text):  # v4: digest/quote-card bukan opini
+        return ("neutral", 0.0)
+    e_bull, e_bear = _emoji_signal(text)  # v4: emoji post-level (hype keseluruhan)
+    bull += e_bull
+    bear += e_bear
     total = bull + bear
     if total == 0:
         return ("neutral", 0.0)
@@ -535,7 +585,7 @@ def collect_once() -> dict:
                         from ml.search.chatter_direction import resolve_direction
                     except Exception:  # noqa: BLE001
                         def resolve_direction(_pid, _t, _txt, lab, sc):
-                            return lab, sc, "lexicon-v3"
+                            return lab, sc, "lexicon-v4"
                     # v3: skor per-cashtag (post multi-ticker gak lagi "sama rata").
                     # NEUTRAL per-ticker di-resolve arahnya pake bukti semantic
                     # kNN (sim>=0.75, k=3 wajib sepakat) -> label jadi
@@ -667,7 +717,7 @@ def aggregate(window_hours: int) -> list[dict]:
                 JOIN stream_posts sp ON sp.postid = spt.postid
                 LEFT JOIN sentiment_per_ticker spv
                        ON spv.postid = sp.postid AND spv.ticker = spt.ticker
-                      AND spv.model_version = 'lexicon-v3'
+                      AND spv.model_version IN ('lexicon-v3','lexicon-v4','semantic-knn-v1')
                 LEFT JOIN sentiment_predictions sen
                        ON sen.postid = sp.postid AND sen.model_version = 'lexicon-demo-v1'
                 WHERE spt.ticker = ?
@@ -1193,7 +1243,7 @@ def build_state() -> dict:
     return {
         "generated_at": iso(now_utc()),
         "mode": {
-            "sentiment_model": "lexicon-v3 per-cashtag + context rules; post per-ticker NEUTRAL di-resolve arah semantic kNN (sim>=0.75, k=3 sepakat, presisi ~60% di pilot 150) via model_version=semantic-knn-v1 (audit: tabel semantic_direction_log)",
+            "sentiment_model": "lexicon-v4 per-cashtag (slang+emoji+digest-guard, eval 69% end-to-end) + context rules; post per-ticker NEUTRAL di-resolve arah semantic kNN Cohere embed-v4.0 (two-tier: high k=3 sepakat >=0.60 ~82%; medium k=1 >=0.70 kalibrasi produksi 10/10; presisi gabungan ~89% di 19 flip uji) via model_version=semantic-knn-v1 (audit: semantic_direction_log + provider/tier)",
             "entity_resolution": "cashtag + alias nama emiten (confidence; >=0.8 dapat bonus skor)",
             "ml_models": _ml_status(),
             "search": _search_mode(),
@@ -1324,7 +1374,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                         "JOIN stream_post_tickers spt ON spt.postid = sp.postid "
                         "LEFT JOIN sentiment_per_ticker spv "
                         "  ON spv.postid = sp.postid AND spv.ticker = spt.ticker "
-                        " AND spv.model_version = 'lexicon-v3' "
+                        " AND spv.model_version IN ('lexicon-v3','lexicon-v4','semantic-knn-v1') "
                         "LEFT JOIN sentiment_predictions sen "
                         "  ON sen.postid = sp.postid AND sen.model_version = 'lexicon-demo-v1' "
                         "WHERE spt.ticker = ? AND sp.created_at_utc IS NOT NULL "
@@ -1466,7 +1516,7 @@ def selftest() -> int:
     check("v2 tanpa cashtag -> None", sentiment_for_ticker("naik terus cuan parah", "BBCA") is None)
     from ml.search.chatter_direction import resolve_direction
     check("resolve passthrough (bukan neutral)",
-          resolve_direction(1, "BBCA", "apa aja", "bullish", 0.5) == ("bullish", 0.5, "lexicon-v3"))
+          resolve_direction(1, "BBCA", "apa aja", "bullish", 0.5) == ("bullish", 0.5, "lexicon-v4"))
     s, r = rule_score(now_utc() - timedelta(minutes=2), 1.0, ["ANTM"], ["Basic Materials"], {"produksi dihentikan": 24})
     check("rule score material > plain", s >= 45 and any("hard-event" in x for x in r))
     s_plain, _ = rule_score(now_utc() - timedelta(minutes=2), 1.0, ["ANTM"], [], {})

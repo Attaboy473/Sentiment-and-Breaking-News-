@@ -37,6 +37,9 @@ MODEL_COHERE = "embed-v4.0"
 #   MiniLM k=3 @0.70 -> 67% (9 flip)  | k=1 @0.70 -> 61% (23 flip)
 MIN_SIM_BY_MODEL = {MODEL_COHERE: 0.60, MODEL_MINILM: 0.70}
 MIN_SIM = 0.60  # default (provider utama)
+# Threshold tier MEDIUM (k=1): kalibrasi produksi 7 Sep (pool 94, 56 post uji)
+# zona 0.60-0.70 cuma 56-65% presisi -> TIDAK layak flip; >= 0.70 = 100% (10/10).
+MEDIUM_SIM_BY_MODEL = {MODEL_COHERE: 0.70, MODEL_MINILM: 0.75}
 TOP_K = 3
 MIN_POOL = 5
 _cache_pool = {}        # model -> [(postid, label, vec)]
@@ -127,11 +130,19 @@ def semantic_direction_ex(text, exclude_pid=None):
             sims.sort(reverse=True)
             min_sim = MIN_SIM_BY_MODEL.get(model, MIN_SIM)
             top = [s for s in sims if s[0] <= 0.99][:TOP_K]  # >0.99 = duplikat teks
-            if not top or top[0][0] < min_sim or len(top) < TOP_K:
+            if not top or top[0][0] < min_sim:
                 return None
+            # TWO-TIER (benchmark final 7 Sep):
+            #   high   = k=3 semua >= urutan & sepakat  -> presisi 82%
+            #   medium = k=1 tetangga terdekat >= thr   -> presisi 80% (35 flip)
+            # Union-nya = rule k=1 (superset strict), jadi coverage naik ~3x
+            # dgn presisi tinggal di range 80-82%.
             labels = {l for _, l, _ in top}
-            if len(labels) != 1:  # wajib sepakat
-                return None
+            med_thr = MEDIUM_SIM_BY_MODEL.get(model, min_sim + 0.10)
+            tier = ("high" if (len(top) == TOP_K and len(labels) == 1
+                               and top[-1][0] >= min_sim) else "medium")
+            if tier == "medium" and top[0][0] < med_thr:
+                return None  # bukti medium di bawah ambang kalibrasi -> abstain
             con = sqlite3.connect(DB_PATH, timeout=15)
             try:
                 matches = []
@@ -145,7 +156,7 @@ def semantic_direction_ex(text, exclude_pid=None):
                 con.close()
             return {"direction": top[0][1], "sim": round(top[0][0], 3),
                     "matches": matches, "provider": model,
-                    "threshold": min_sim}
+                    "threshold": min_sim, "tier": tier}
         except Exception as e:  # noqa: BLE001 — provider gagal -> fallback
             last_err = e
     if last_err is not None:
@@ -173,15 +184,21 @@ def resolve_direction(postid, ticker, text, per_ticker_label, per_ticker_score):
     tabel semantic_direction_log (audit + bahan kalibrasi berikutnya).
     """
     if (per_ticker_label or "neutral") != "neutral":
-        return per_ticker_label, per_ticker_score, "lexicon-v3"
+        return per_ticker_label, per_ticker_score, "lexicon-v4"
     hint = semantic_direction_ex(text, exclude_pid=postid)
     if not hint:
-        return "neutral", per_ticker_score, "lexicon-v3"
+        return "neutral", per_ticker_score, "lexicon-v4"
     direction = hint["direction"]
     sim = hint["sim"]
     thr = hint.get("threshold", MIN_SIM)
+    tier = hint.get("tier", "high")
+    # Skor magnitude = margin di atas threshold provider masing2, capped 0.2.
     margin = min(0.2, max(0.0, sim - thr))
     score = round(margin if direction == "bullish" else -margin, 3)
+    if tier == "medium":
+        # Tier medium (1 tetangga >= thr, presisi 80%): skor dikali 0.8 —
+        # bukti lebih tipis dari high (82%) tapi tetap searah.
+        score = round(score * 0.8, 3)
     for _attempt in range(4):  # audit: retry WAL-busy (collector memegang write lock)
         try:
             con = sqlite3.connect(DB_PATH, timeout=15)
@@ -202,11 +219,13 @@ def resolve_direction(postid, ticker, text, per_ticker_label, per_ticker_score):
             cols = {r[1] for r in con.execute("PRAGMA table_info(semantic_direction_log)")}
             if "provider" not in cols:
                 con.execute("ALTER TABLE semantic_direction_log ADD COLUMN provider TEXT")
+            if "tier" not in cols:
+                con.execute("ALTER TABLE semantic_direction_log ADD COLUMN tier TEXT")
             con.execute(
                 "INSERT OR REPLACE INTO semantic_direction_log "
-                "(postid, ticker, direction, sim, created_at, provider) VALUES (?,?,?,?,?,?)",
+                "(postid, ticker, direction, sim, created_at, provider, tier) VALUES (?,?,?,?,?,?,?)",
                 (postid, ticker, direction, sim,
-                 datetime.now(timezone.utc).isoformat(), hint.get("provider")))
+                 datetime.now(timezone.utc).isoformat(), hint.get("provider"), tier))
             con.commit()
         finally:
             con.close()
